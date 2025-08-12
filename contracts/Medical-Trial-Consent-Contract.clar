@@ -2,6 +2,7 @@
 (define-data-var next-trial-id uint u1)
 (define-data-var next-consent-id uint u1)
 (define-data-var current-block-height uint u1)
+(define-data-var total-escrow-balance uint u0)
 
 (define-map trials
     { trial-id: uint }
@@ -17,6 +18,8 @@
         required-age: uint,
         compensation: uint,
         created-at: uint,
+        escrow-deposited: bool,
+        escrow-amount: uint,
     }
 )
 
@@ -32,6 +35,7 @@
         emergency-contact: (string-ascii 64),
         medical-history: (string-ascii 256),
         is-withdrawn: bool,
+        compensation-claimed: bool,
     }
 )
 
@@ -68,6 +72,20 @@
     }
 )
 
+(define-map trial-analytics
+    { trial-id: uint }
+    {
+        total-enrolled: uint,
+        total-withdrawn: uint,
+        total-completed: uint,
+        completion-rate: uint,
+        withdrawal-rate: uint,
+        compensation-paid: uint,
+        average-participation-duration: uint,
+        last-updated: uint,
+    }
+)
+
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-TRIAL-NOT-FOUND (err u101))
 (define-constant ERR-TRIAL-INACTIVE (err u102))
@@ -79,6 +97,11 @@
 (define-constant ERR-INVALID-AGE (err u108))
 (define-constant ERR-INVALID-PARTICIPANT (err u109))
 (define-constant ERR-TRIAL-NOT-STARTED (err u110))
+(define-constant ERR-INSUFFICIENT-FUNDS (err u111))
+(define-constant ERR-ESCROW-ALREADY-DEPOSITED (err u112))
+(define-constant ERR-ESCROW-NOT-DEPOSITED (err u113))
+(define-constant ERR-COMPENSATION-ALREADY-CLAIMED (err u114))
+(define-constant ERR-INVALID-AMOUNT (err u115))
 
 (define-private (get-current-block)
     (var-get current-block-height)
@@ -118,6 +141,8 @@
             required-age: required-age,
             compensation: compensation,
             created-at: current-height,
+            escrow-deposited: false,
+            escrow-amount: u0,
         })
 
         (var-set next-trial-id (+ trial-id u1))
@@ -181,6 +206,7 @@
             emergency-contact: emergency-contact,
             medical-history: medical-history,
             is-withdrawn: false,
+            compensation-claimed: false,
         })
 
         (map-set participant-trials {
@@ -279,6 +305,97 @@
     )
 )
 
+(define-public (deposit-escrow (trial-id uint))
+    (let (
+            (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR-TRIAL-NOT-FOUND))
+            (required-amount (* (get compensation trial) (get max-participants trial)))
+        )
+        (asserts! (is-eq tx-sender (get organizer trial)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get escrow-deposited trial)) ERR-ESCROW-ALREADY-DEPOSITED)
+        (asserts! (> required-amount u0) ERR-INVALID-AMOUNT)
+
+        (try! (stx-transfer? required-amount tx-sender (as-contract tx-sender)))
+
+        (map-set trials { trial-id: trial-id }
+            (merge trial {
+                escrow-deposited: true,
+                escrow-amount: required-amount,
+            })
+        )
+
+        (var-set total-escrow-balance
+            (+ (var-get total-escrow-balance) required-amount)
+        )
+        (ok required-amount)
+    )
+)
+
+(define-public (claim-compensation (trial-id uint))
+    (let (
+            (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR-TRIAL-NOT-FOUND))
+            (participant-trial (unwrap!
+                (map-get? participant-trials {
+                    participant: tx-sender,
+                    trial-id: trial-id,
+                })
+                ERR-NO-CONSENT-FOUND
+            ))
+            (consent-id (get consent-id participant-trial))
+            (consent (unwrap! (map-get? consents { consent-id: consent-id })
+                ERR-NO-CONSENT-FOUND
+            ))
+            (compensation-amount (get compensation trial))
+            (current-block (get-current-block))
+        )
+        (asserts! (get escrow-deposited trial) ERR-ESCROW-NOT-DEPOSITED)
+        (asserts! (>= current-block (get end-block trial)) ERR-TRIAL-NOT-STARTED)
+        (asserts! (get consent-given consent) ERR-NO-CONSENT-FOUND)
+        (asserts! (not (get is-withdrawn consent)) ERR-ALREADY-WITHDRAWN)
+        (asserts! (not (get compensation-claimed consent))
+            ERR-COMPENSATION-ALREADY-CLAIMED
+        )
+
+        (try! (as-contract (stx-transfer? compensation-amount tx-sender tx-sender)))
+
+        (map-set consents { consent-id: consent-id }
+            (merge consent { compensation-claimed: true })
+        )
+
+        (var-set total-escrow-balance
+            (- (var-get total-escrow-balance) compensation-amount)
+        )
+        (ok compensation-amount)
+    )
+)
+
+(define-public (refund-escrow (trial-id uint))
+    (let (
+            (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR-TRIAL-NOT-FOUND))
+            (current-block (get-current-block))
+            (escrow-amount (get escrow-amount trial))
+            (participants-count (get current-participants trial))
+            (compensation-per-participant (get compensation trial))
+            (used-amount (* participants-count compensation-per-participant))
+            (refund-amount (- escrow-amount used-amount))
+        )
+        (asserts! (is-eq tx-sender (get organizer trial)) ERR-NOT-AUTHORIZED)
+        (asserts! (get escrow-deposited trial) ERR-ESCROW-NOT-DEPOSITED)
+        (asserts! (>= current-block (get end-block trial)) ERR-TRIAL-NOT-STARTED)
+        (asserts! (> refund-amount u0) ERR-INVALID-AMOUNT)
+
+        (try! (as-contract (stx-transfer? refund-amount tx-sender tx-sender)))
+
+        (map-set trials { trial-id: trial-id }
+            (merge trial { escrow-amount: used-amount })
+        )
+
+        (var-set total-escrow-balance
+            (- (var-get total-escrow-balance) refund-amount)
+        )
+        (ok refund-amount)
+    )
+)
+
 (define-public (advance-block)
     (begin
         (increment-block)
@@ -327,12 +444,17 @@
                 (current-block (get-current-block))
                 (is-started (>= current-block (get start-block trial)))
                 (is-ended (>= current-block (get end-block trial)))
+                (is-expired (match (map-get? trial-expiration-notifications { trial-id: trial-id })
+                    notification-data (get expired notification-data)
+                    false
+                ))
             )
             (some {
                 trial-id: trial-id,
                 is-active: (get is-active trial),
                 is-started: is-started,
                 is-ended: is-ended,
+                is-expired: is-expired,
                 participants: (get current-participants trial),
                 max-participants: (get max-participants trial),
                 blocks-remaining: (if is-ended
@@ -406,4 +528,88 @@
 
 (define-read-only (get-participant-trials (participant principal))
     (ok "Use external indexing to list participant trials")
+)
+(define-map trial-expiration-notifications
+    { trial-id: uint }
+    { expired: bool }
+)
+
+(define-public (expire-trial (trial-id uint))
+    (let ((trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR-TRIAL-NOT-FOUND)))
+        (if (>= (get-current-block) (get end-block trial))
+            (begin
+                (map-set trial-expiration-notifications { trial-id: trial-id } { expired: true })
+                (map-set trials { trial-id: trial-id }
+                    (merge trial { is-active: false })
+                )
+                (ok true)
+            )
+            (ok false)
+        )
+    )
+)
+
+(define-read-only (get-trial-expiration-notifications (trial-id uint))
+    (map-get? trial-expiration-notifications { trial-id: trial-id })
+)
+
+(define-private (calculate-percentage
+        (numerator uint)
+        (denominator uint)
+    )
+    (if (is-eq denominator u0)
+        u0
+        (/ (* numerator u100) denominator)
+    )
+)
+
+(define-public (update-trial-analytics (trial-id uint))
+    (let (
+            (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR-TRIAL-NOT-FOUND))
+            (current-block (get-current-block))
+            (total-enrolled (get current-participants trial))
+            (total-withdrawn u0)
+            (total-completed u0)
+            (compensation-paid u0)
+        )
+        (asserts! (is-eq tx-sender (get organizer trial)) ERR-NOT-AUTHORIZED)
+        (asserts! (>= current-block (get end-block trial)) ERR-TRIAL-NOT-STARTED)
+
+        (let (
+                (completion-rate (calculate-percentage total-completed total-enrolled))
+                (withdrawal-rate (calculate-percentage total-withdrawn total-enrolled))
+            )
+            (map-set trial-analytics { trial-id: trial-id } {
+                total-enrolled: total-enrolled,
+                total-withdrawn: total-withdrawn,
+                total-completed: total-completed,
+                completion-rate: completion-rate,
+                withdrawal-rate: withdrawal-rate,
+                compensation-paid: compensation-paid,
+                average-participation-duration: u0,
+                last-updated: current-block,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-trial-analytics (trial-id uint))
+    (map-get? trial-analytics { trial-id: trial-id })
+)
+
+(define-read-only (get-trial-performance-summary (trial-id uint))
+    (match (map-get? trial-analytics { trial-id: trial-id })
+        analytics (some {
+            trial-id: trial-id,
+            enrolled: (get total-enrolled analytics),
+            completed: (get total-completed analytics),
+            withdrawn: (get total-withdrawn analytics),
+            completion-rate: (get completion-rate analytics),
+            withdrawal-rate: (get withdrawal-rate analytics),
+            total-compensation: (get compensation-paid analytics),
+            last-updated: (get last-updated analytics),
+        })
+        none
+    )
 )
