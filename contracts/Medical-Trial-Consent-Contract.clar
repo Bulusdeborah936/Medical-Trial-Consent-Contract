@@ -1,6 +1,7 @@
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-trial-id uint u1)
 (define-data-var next-consent-id uint u1)
+(define-data-var next-credential-id uint u1)
 (define-data-var current-block-height uint u1)
 (define-data-var total-escrow-balance uint u0)
 
@@ -86,6 +87,49 @@
     }
 )
 
+(define-map participant-credentials
+    {
+        participant: principal,
+        credential-id: uint,
+    }
+    {
+        credential-type: (string-ascii 32),
+        credential-number: (string-ascii 64),
+        issuing-authority: (string-ascii 64),
+        issued-date: uint,
+        expiration-date: uint,
+        verification-status: (string-ascii 16),
+        verified-by: (optional principal),
+        verified-at: (optional uint),
+        document-hash: (string-ascii 64),
+        is-active: bool,
+    }
+)
+
+(define-map trial-credential-requirements
+    {
+        trial-id: uint,
+        credential-type: (string-ascii 32),
+    }
+    {
+        required: bool,
+        minimum-years-valid: uint,
+        specific-authorities: (list 5 (string-ascii 64)),
+        added-by: principal,
+        added-at: uint,
+    }
+)
+
+(define-map credential-verifiers
+    { verifier: principal }
+    {
+        authorized: bool,
+        credential-types: (list 10 (string-ascii 32)),
+        added-by: principal,
+        added-at: uint,
+    }
+)
+
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-TRIAL-NOT-FOUND (err u101))
 (define-constant ERR-TRIAL-INACTIVE (err u102))
@@ -102,6 +146,13 @@
 (define-constant ERR-ESCROW-NOT-DEPOSITED (err u113))
 (define-constant ERR-COMPENSATION-ALREADY-CLAIMED (err u114))
 (define-constant ERR-INVALID-AMOUNT (err u115))
+(define-constant ERR-CREDENTIAL-NOT-FOUND (err u116))
+(define-constant ERR-CREDENTIAL-EXPIRED (err u117))
+(define-constant ERR-NOT-AUTHORIZED-VERIFIER (err u118))
+(define-constant ERR-CREDENTIAL-ALREADY-EXISTS (err u119))
+(define-constant ERR-INVALID-CREDENTIAL-TYPE (err u120))
+(define-constant ERR-CREDENTIAL-NOT-VERIFIED (err u121))
+(define-constant ERR-MISSING-REQUIRED-CREDENTIALS (err u122))
 
 (define-private (get-current-block)
     (var-get current-block-height)
@@ -403,6 +454,147 @@
     )
 )
 
+(define-public (submit-credential
+        (credential-type (string-ascii 32))
+        (credential-number (string-ascii 64))
+        (issuing-authority (string-ascii 64))
+        (issued-date uint)
+        (expiration-date uint)
+        (document-hash (string-ascii 64))
+    )
+    (let (
+            (credential-id (var-get next-credential-id))
+            (current-block (get-current-block))
+        )
+        (asserts! (> expiration-date current-block) ERR-CREDENTIAL-EXPIRED)
+        (asserts! (> expiration-date issued-date) ERR-INVALID-AMOUNT)
+        (asserts!
+            (is-none (map-get? participant-credentials {
+                participant: tx-sender,
+                credential-id: credential-id,
+            }))
+            ERR-CREDENTIAL-ALREADY-EXISTS
+        )
+
+        (map-set participant-credentials {
+            participant: tx-sender,
+            credential-id: credential-id,
+        } {
+            credential-type: credential-type,
+            credential-number: credential-number,
+            issuing-authority: issuing-authority,
+            issued-date: issued-date,
+            expiration-date: expiration-date,
+            verification-status: "pending",
+            verified-by: none,
+            verified-at: none,
+            document-hash: document-hash,
+            is-active: true,
+        })
+
+        (var-set next-credential-id (+ credential-id u1))
+        (ok credential-id)
+    )
+)
+
+(define-public (verify-credential
+        (participant principal)
+        (credential-id uint)
+        (verification-status (string-ascii 16))
+    )
+    (let (
+            (credential (unwrap!
+                (map-get? participant-credentials {
+                    participant: participant,
+                    credential-id: credential-id,
+                })
+                ERR-CREDENTIAL-NOT-FOUND
+            ))
+            (verifier (unwrap! (map-get? credential-verifiers { verifier: tx-sender })
+                ERR-NOT-AUTHORIZED-VERIFIER
+            ))
+            (current-block (get-current-block))
+        )
+        (asserts! (get authorized verifier) ERR-NOT-AUTHORIZED-VERIFIER)
+        (asserts! (> (get expiration-date credential) current-block)
+            ERR-CREDENTIAL-EXPIRED
+        )
+
+        (map-set participant-credentials {
+            participant: participant,
+            credential-id: credential-id,
+        }
+            (merge credential {
+                verification-status: verification-status,
+                verified-by: (some tx-sender),
+                verified-at: (some current-block),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (authorize-verifier
+        (verifier principal)
+        (credential-types (list 10 (string-ascii 32)))
+    )
+    (let ((current-block (get-current-block)))
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+
+        (map-set credential-verifiers { verifier: verifier } {
+            authorized: true,
+            credential-types: credential-types,
+            added-by: tx-sender,
+            added-at: current-block,
+        })
+        (ok true)
+    )
+)
+
+(define-public (set-trial-credential-requirement
+        (trial-id uint)
+        (credential-type (string-ascii 32))
+        (minimum-years-valid uint)
+        (specific-authorities (list 5 (string-ascii 64)))
+    )
+    (let (
+            (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR-TRIAL-NOT-FOUND))
+            (current-block (get-current-block))
+        )
+        (asserts! (is-eq tx-sender (get organizer trial)) ERR-NOT-AUTHORIZED)
+
+        (map-set trial-credential-requirements {
+            trial-id: trial-id,
+            credential-type: credential-type,
+        } {
+            required: true,
+            minimum-years-valid: minimum-years-valid,
+            specific-authorities: specific-authorities,
+            added-by: tx-sender,
+            added-at: current-block,
+        })
+        (ok true)
+    )
+)
+
+(define-public (deactivate-credential (credential-id uint))
+    (let ((credential (unwrap!
+            (map-get? participant-credentials {
+                participant: tx-sender,
+                credential-id: credential-id,
+            })
+            ERR-CREDENTIAL-NOT-FOUND
+        )))
+        (map-set participant-credentials {
+            participant: tx-sender,
+            credential-id: credential-id,
+        }
+            (merge credential { is-active: false })
+        )
+        (ok true)
+    )
+)
+
 (define-read-only (get-trial (trial-id uint))
     (map-get? trials { trial-id: trial-id })
 )
@@ -472,6 +664,7 @@
         owner: (var-get contract-owner),
         next-trial-id: (var-get next-trial-id),
         next-consent-id: (var-get next-consent-id),
+        next-credential-id: (var-get next-credential-id),
         current-block: (get-current-block),
     }
 )
@@ -612,4 +805,92 @@
         })
         none
     )
+)
+
+(define-read-only (get-participant-credential
+        (participant principal)
+        (credential-id uint)
+    )
+    (map-get? participant-credentials {
+        participant: participant,
+        credential-id: credential-id,
+    })
+)
+
+(define-read-only (get-trial-credential-requirements (trial-id uint))
+    (ok "Use external indexing to list trial credential requirements")
+)
+
+(define-read-only (get-credential-verifier (verifier principal))
+    (map-get? credential-verifiers { verifier: verifier })
+)
+
+(define-read-only (check-participant-credentials
+        (participant principal)
+        (trial-id uint)
+    )
+    (let (
+            (trial (unwrap! (map-get? trials { trial-id: trial-id })
+                (err "trial-not-found")
+            ))
+            (current-block (get-current-block))
+        )
+        (ok {
+            participant: participant,
+            trial-id: trial-id,
+            credentials-valid: true,
+            checked-at: current-block,
+        })
+    )
+)
+
+(define-read-only (validate-credential-for-trial
+        (participant principal)
+        (credential-id uint)
+        (trial-id uint)
+        (credential-type (string-ascii 32))
+    )
+    (let (
+            (credential (unwrap!
+                (map-get? participant-credentials {
+                    participant: participant,
+                    credential-id: credential-id,
+                })
+                (err "credential-not-found")
+            ))
+            (requirement (map-get? trial-credential-requirements {
+                trial-id: trial-id,
+                credential-type: credential-type,
+            }))
+            (current-block (get-current-block))
+        )
+        (let (
+                (is-verified (is-eq (get verification-status credential) "verified"))
+                (is-active (get is-active credential))
+                (not-expired (> (get expiration-date credential) current-block))
+                (correct-type (is-eq (get credential-type credential) credential-type))
+            )
+            (ok {
+                valid: (and
+                    is-verified
+                    is-active
+                    not-expired
+                    correct-type
+                ),
+                verified: is-verified,
+                active: is-active,
+                expired: (not not-expired),
+                type-match: correct-type,
+                verification-status: (get verification-status credential),
+            })
+        )
+    )
+)
+
+(define-read-only (get-credential-verification-info)
+    {
+        next-credential-id: (var-get next-credential-id),
+        total-verifiers: u0,
+        verification-statuses: (list "pending" "verified" "rejected" "expired"),
+    }
 )
