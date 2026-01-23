@@ -1,0 +1,25 @@
+[project]
+name = 'Medical-Trial-Consent-Contract'
+description = 'Smart contract for managing medical trial consent with notification system'
+authors = []
+telemetry = true
+cache_dir = '.cache'
+requirements = []
+
+[contracts.medical-trial-consent-contract]
+path = 'contracts/medical-trial-consent-contract.clar'
+clarity_version = 3
+epoch = 3.0
+
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
+
+[repl.remote_data]
+enabled = false
+api_url = 'https://api.hiro.so'

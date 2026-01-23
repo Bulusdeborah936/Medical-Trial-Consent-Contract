@@ -1,0 +1,30 @@
+[network]
+name = "devnet"
+deployment_fee_rate = 10
+
+[accounts.deployer]
+mnemonic = "twice kind fence tip hidden tilt action fragile skin nothing glory cousin green tomorrow spring wrist shed math olympic multiply hip blue scout claw"
+balance = 100_000_000_000_000
+
+[accounts.wallet_1] 
+mnemonic = "sell invite acquire kitten bamboo drastic jelly vivid peace spawn twice guilt pave pen trash pretty park cube fragile unaware remain midnight betray rebuild"
+balance = 100_000_000_000_000
+
+[accounts.wallet_2]
+mnemonic = "hold excess usual excess ring elephant install account glad dry fragile donkey gaze humble truck breeze nation gasp vacuum limb head keep delay hospital"
+balance = 100_000_000_000_000
+
+[accounts.wallet_3]
+mnemonic = "board list obtain sugar hour worth raven scout denial thunder horse logic fury scorpion fold genuine phrase wealth news aim below celery when cabin"
+balance = 100_000_000_000_000
+
+[devnet]
+disable_bitcoin_explorer = true
+working_dir = "tmp/devnet"
+epoch_2_0 = 102
+epoch_2_05 = 112
+epoch_2_1 = 122
+
+[devnet.orchestrator]
+public_key = "02f632f5cab2c1c86d96b8983d0b806b1983d0b9d446d2e5c1b3b3abcf0d4ed07c"
+mining_key = "9410ff8b39b94c31b54ab039b9b9d7a825de78e9b6d74e4b1b38c93b0c3b6a4"
