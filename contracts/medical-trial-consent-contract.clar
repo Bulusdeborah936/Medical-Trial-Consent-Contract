@@ -81,6 +81,23 @@
     }
 )
 
+(define-map credentials
+    { credential-id: uint }
+    {
+        trial-id: uint,
+        participant: principal,
+        issuer: principal,
+        issued-at: uint,
+        metadata-hash: (buff 32),
+        revoked: bool,
+    }
+)
+
+(define-map participant-credentials
+    { trial-id: uint, participant: principal }
+    { credential-id: uint }
+)
+
 ;; Smart Notification System maps
 (define-map notifications 
     { notification-id: uint }
@@ -129,6 +146,11 @@
 (define-constant ERR-COMPENSATION-ALREADY-CLAIMED (err u114))
 (define-constant ERR-INVALID-AMOUNT (err u115))
 
+(define-constant ERR-CREDENTIAL-NOT-FOUND (err u200))
+(define-constant ERR-CREDENTIAL-ALREADY-ISSUED (err u201))
+(define-constant ERR-CREDENTIAL-ALREADY-REVOKED (err u202))
+(define-constant ERR-TRIAL-NOT-COMPLETED (err u203))
+
 ;; Error constants for Smart Notification System
 (define-constant ERR-NOTIFICATION-NOT-FOUND (err u300))
 (define-constant ERR-INVALID-NOTIFICATION-TYPE (err u301))
@@ -145,11 +167,14 @@
 )
 
 (define-private (is-valid-notification-type (notification-type (string-ascii 50)))
-    (or 
+    (or
         (is-eq notification-type "trial-start-reminder")
         (is-eq notification-type "trial-end-warning")
         (is-eq notification-type "compensation-available")
         (is-eq notification-type "consent-expiring")
+        (is-eq notification-type "consent-confirmation")
+        (is-eq notification-type "consent-withdrawal")
+        (is-eq notification-type "compensation-claimed")
     )
 )
 
@@ -404,6 +429,7 @@
             (consent (unwrap! (map-get? consents { consent-id: consent-id })
                 ERR-NO-CONSENT-FOUND
             ))
+            (participant tx-sender)
             (compensation-amount (get compensation trial))
             (current-block (get-current-block))
         )
@@ -415,7 +441,7 @@
             ERR-COMPENSATION-ALREADY-CLAIMED
         )
 
-        (try! (as-contract (stx-transfer? compensation-amount tx-sender tx-sender)))
+        (try! (as-contract (stx-transfer? compensation-amount tx-sender participant)))
 
         (map-set consents { consent-id: consent-id }
             (merge consent { compensation-claimed: true })
@@ -435,6 +461,58 @@
         ))
 
         (ok compensation-amount)
+    )
+)
+
+(define-public (issue-credential
+        (trial-id uint)
+        (participant principal)
+        (metadata-hash (buff 32))
+    )
+    (let (
+            (trial (unwrap! (map-get? trials { trial-id: trial-id }) ERR-TRIAL-NOT-FOUND))
+            (participant-trial (unwrap!
+                (map-get? participant-trials { participant: participant, trial-id: trial-id })
+                ERR-NO-CONSENT-FOUND
+            ))
+            (consent (unwrap!
+                (map-get? consents { consent-id: (get consent-id participant-trial) })
+                ERR-NO-CONSENT-FOUND
+            ))
+            (current-block (get-current-block))
+        )
+        (asserts! (is-eq tx-sender (get organizer trial)) ERR-NOT-AUTHORIZED)
+        (asserts! (>= current-block (get end-block trial)) ERR-TRIAL-NOT-COMPLETED)
+        (asserts!
+            (is-none (map-get? participant-credentials { trial-id: trial-id, participant: participant }))
+            ERR-CREDENTIAL-ALREADY-ISSUED
+        )
+        (asserts! (and (get consent-given consent) (not (get is-withdrawn consent))) ERR-NO-CONSENT-FOUND)
+        (let ((credential-id (var-get next-credential-id)))
+            (map-set credentials { credential-id: credential-id } {
+                trial-id: trial-id,
+                participant: participant,
+                issuer: tx-sender,
+                issued-at: current-block,
+                metadata-hash: metadata-hash,
+                revoked: false,
+            })
+            (map-set participant-credentials { trial-id: trial-id, participant: participant } { credential-id: credential-id })
+            (var-set next-credential-id (+ credential-id u1))
+            (ok credential-id)
+        )
+    )
+)
+
+(define-public (revoke-credential (credential-id uint))
+    (let ((credential (unwrap! (map-get? credentials { credential-id: credential-id }) ERR-CREDENTIAL-NOT-FOUND)))
+        (asserts!
+            (or (is-eq tx-sender (get issuer credential)) (is-eq tx-sender (var-get contract-owner)))
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (not (get revoked credential)) ERR-CREDENTIAL-ALREADY-REVOKED)
+        (map-set credentials { credential-id: credential-id } (merge credential { revoked: true }))
+        (ok true)
     )
 )
 
@@ -613,9 +691,18 @@
         owner: (var-get contract-owner),
         next-trial-id: (var-get next-trial-id),
         next-consent-id: (var-get next-consent-id),
+        next-credential-id: (var-get next-credential-id),
         notification-counter: (var-get notification-counter),
         current-block: (get-current-block),
     }
+)
+
+(define-read-only (get-credential (credential-id uint))
+    (map-get? credentials { credential-id: credential-id })
+)
+
+(define-read-only (get-participant-credential-id (trial-id uint) (participant principal))
+    (map-get? participant-credentials { trial-id: trial-id, participant: participant })
 )
 
 ;; Smart Notification System read-only functions
@@ -640,7 +727,15 @@
 (define-read-only (get-notification-summary)
     {
         total-notifications: (var-get notification-counter),
-        supported-types: (list "trial-start-reminder" "trial-end-warning" "compensation-available" "consent-expiring"),
+        supported-types: (list
+            "trial-start-reminder"
+            "trial-end-warning"
+            "compensation-available"
+            "consent-expiring"
+            "consent-confirmation"
+            "consent-withdrawal"
+            "compensation-claimed"
+        ),
         delivery-methods: (list "email" "sms" "in-app")
     }
 )
